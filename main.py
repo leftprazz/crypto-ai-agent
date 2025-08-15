@@ -32,6 +32,7 @@ import feedparser
 from dotenv import load_dotenv
 load_dotenv()
 os.environ["SSL_CERT_FILE"] = certifi.where()
+os.environ["REQUESTS_CA_BUNDLE"] = certifi.where()
 
 # ---------------------------- Config ----------------------------
 
@@ -48,6 +49,7 @@ CG_API_BASE = os.getenv("COINGECKO_API_BASE", "https://api.coingecko.com/api/v3"
 TWITTER_BEARER = os.getenv("TWITTER_BEARER_TOKEN", "")
 NEWSAPI_KEY = os.getenv("NEWSAPI_KEY", "")
 CG_API_KEY = os.getenv("COINGECKO_API_KEY", "")
+CG_API_BASE = os.getenv("COINGECKO_API_BASE", "https://api.coingecko.com/api/v3")
 
 SMTP_HOST = os.getenv("SMTP_HOST", "")
 SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
@@ -121,7 +123,8 @@ def backoff_delays():
 def cg_get(path: str, params: dict | None = None):
     headers = {}
     if CG_API_KEY:
-        # CoinGecko accepts this header for API keys (free/pro)
+        # kirim dua-duanya; CG akan terima salah satunya sesuai tier
+        headers["x-cg-pro-api-key"] = CG_API_KEY
         headers["x-cg-demo-api-key"] = CG_API_KEY
     url = f"{CG_API_BASE}{path}"
     r = requests.get(url, params=params or {}, headers=headers, timeout=20)
@@ -324,7 +327,6 @@ def fetch_twitter_texts(query: str, limit: int = 50) -> List[str]:
     headers = {"Authorization": f"Bearer {TWITTER_BEARER}"} if TWITTER_BEARER else None
     if headers:
         try:
-            # Recent search last 24h
             url = "https://api.twitter.com/2/tweets/search/recent"
             params = {
                 "query": f"{query} -is:retweet lang:en",
@@ -341,22 +343,15 @@ def fetch_twitter_texts(query: str, limit: int = 50) -> List[str]:
         except Exception as e:
             record_failure("twitter_api", str(e))
             return []
-    # fallback to snscrape CLI
+
+    # Fallback: CLI snscrape sekali saja
     try:
         import subprocess, json as _json
         since_ts = int((datetime.now(timezone.utc)-timedelta(hours=24)).timestamp())
         cmd = ["snscrape", "--jsonl", "--max-results", str(limit),
                "twitter-search", f"{query} lang:en since_time:{since_ts}"]
-        try:
-            out = subprocess.check_output(cmd, text=True)
-        except Exception:
-            # last-ditch: older module runner path
-            cmd = ["python", "-m", "snscrape.cli", "--jsonl", "--max-results", str(limit),
-                   "twitter-search", f"{query} lang:en since_time:{since_ts}"]
-            out = subprocess.check_output(cmd, text=True)
-
-        texts = []
-        seen = set()
+        out = subprocess.check_output(cmd, text=True)
+        texts, seen = [], set()
         for line in out.splitlines():
             obj = _json.loads(line)
             content = obj.get("content","")
@@ -367,8 +362,10 @@ def fetch_twitter_texts(query: str, limit: int = 50) -> List[str]:
             texts.append(content)
         return texts
     except Exception as e:
+        # stop di sini, jangan fallback -m snscrape.cli lagi
         record_failure("snscrape", str(e))
         return []
+
 
 def fetch_news_texts(coin: str, limit: int = 20) -> Tuple[List[str], List[str]]:
     """
