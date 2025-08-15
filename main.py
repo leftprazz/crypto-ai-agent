@@ -669,12 +669,24 @@ def tick():
         try:
             info = fetch_all_for_coin(coin)
             if not info:
+                logging.info(f"[{coin}] Skipping — data unavailable")
                 continue
+
             should, step, baseline_price = should_alert(coin, info["change_24h_pct"], info["price"])
             if not should:
+                pct = info.get("change_24h_pct")
+                # Log spesifik sesuai permintaan
+                if pct is None or pct < MIN_ALERT_STEP_PCT:
+                    logging.info(f"[{coin}] Skipping email alert — price change below threshold ({(pct or 0):.2f}%)")
+                else:
+                    # (opsional) info tambahan: kasus cooldown atau belum melewati step baru
+                    logging.info(f"[{coin}] Skipping email alert — cooldown/new step not met")
                 continue
-            decision, rationale = decide_entry(info["change_24h_pct"], info["sentiment"], info["price"],
-                                               info["technicals"], info["volume_24h"], None)
+
+            decision, rationale = decide_entry(
+                info["change_24h_pct"], info["sentiment"], info["price"],
+                info["technicals"], info["volume_24h"], None
+            )
             subject, payload = make_email_payload(coin, info, decision, rationale)
             send_email(subject, payload)
             update_alert_state(coin, step, baseline_price)
