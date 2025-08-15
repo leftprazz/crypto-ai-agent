@@ -698,21 +698,50 @@ def tick():
 def daily_digest():
     try:
         date_k = today_key()
+        # Ambil semua koin dari daftar COINS, walau belum ada alert hari ini
         with ENGINE.begin() as conn:
-            rows = conn.execute(text("SELECT coin, last_step FROM alerts WHERE date_key=:d"), {"d": date_k}).mappings().all()
-        summary = []
-        for r in rows:
-            summary.append({"coin": r["coin"], "last_step": r["last_step"]})
+            rows = conn.execute(
+                text("SELECT coin, last_step FROM alerts WHERE date_key=:d"),
+                {"d": date_k}
+            ).mappings().all()
+
+        # Buat dictionary untuk akses cepat
+        step_map = {r["coin"]: r["last_step"] for r in rows}
+
+        # Buat tabel ringkas
+        lines = []
+        lines.append(f"Daily Digest — {now_local().strftime('%Y-%m-%d %H:%M')} Asia/Jakarta")
+        lines.append("")
+        lines.append(f"{'Coin':<6} {'Last Step':<10} {'Note'}")
+        lines.append("-" * 50)
+        for coin in COINS:
+            last_step = step_map.get(coin, "-")
+            note = (
+                f"Highest +{last_step*2}% step today"
+                if isinstance(last_step, int) and last_step > 0
+                else "No alert triggered"
+            )
+            lines.append(f"{coin:<6} {str(last_step):<10} {note}")
+
+        # Gabungkan jadi body plain text
+        body_text = "\n".join(lines)
+
+        # Kirim email plain text
+        msg = MIMEText(body_text, "plain")
         subject = f"[DIGEST] Summary — {now_local().strftime('%Y-%m-%d %H:%M')} Asia/Jakarta"
-        body = {
-            "timestamp_local": f"{now_local().strftime('%Y-%m-%d %H:%M')} (Asia/Jakarta)",
-            "summary": summary,
-            "note": "For each coin, 'last_step' corresponds to the highest +2% step that triggered today."
-        }
-        send_email(subject, body)
+        msg["Subject"] = subject
+        msg["From"] = EMAIL_FROM
+        msg["To"] = EMAIL_TO
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=20) as server:
+            server.starttls()
+            if SMTP_USER:
+                server.login(SMTP_USER, SMTP_PASS)
+            server.sendmail(EMAIL_FROM, [EMAIL_TO], msg.as_string())
+
         logging.info("Daily digest sent.")
     except Exception as e:
         record_failure("daily_digest", str(e))
+
 
 def main():
     logging.info("Starting Crypto Alert Agent…")
