@@ -319,7 +319,11 @@ def get_technicals_via_coingecko(coin: str) -> Tuple[Optional[float], Optional[f
             if not cid:
                 return (None, None, None)
 
-        r = cg_get(f"/coins/{cid}/market_chart", {"vs_currency":"usd","days":"2","interval":"hourly"})
+        r = cg_get(f"/coins/{cid}/market_chart", {
+            "vs_currency": "usd",
+            "days": "90",         # cukup untuk SMA50 & RSI14 harian
+            "interval": "daily"   # atau hapus param interval sekalian (auto-daily)
+        })
         prices = r.json().get("prices", [])
         closes = [p[1] for p in prices]
         if len(closes) < 50:
