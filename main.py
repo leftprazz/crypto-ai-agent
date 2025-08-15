@@ -13,6 +13,7 @@ from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 from dataclasses import dataclass, asdict
 from typing import List, Optional, Dict, Tuple
+import certifi
 
 import requests
 import pandas as pd
@@ -30,6 +31,7 @@ import feedparser
 
 from dotenv import load_dotenv
 load_dotenv()
+os.environ["SSL_CERT_FILE"] = certifi.where()
 
 # ---------------------------- Config ----------------------------
 
@@ -127,13 +129,9 @@ def cg_get(path: str, params: dict | None = None):
     return r
 
 def get_coin_ids_map() -> Dict[str, str]:
-    """
-    Resolve tickers to CoinGecko IDs for fallback/technicals.
-    """
     try:
         r = cg_get("/coins/list")
         data = r.json()
-        # map symbol -> list of ids with that symbol
         by_symbol = {}
         for c in data:
             sym = c.get("symbol","").upper()
@@ -143,12 +141,10 @@ def get_coin_ids_map() -> Dict[str, str]:
         record_failure("coingecko_ids", str(e))
         return {}
 
+
 CG_IDS_CACHE = None
 
 def resolve_hype_symbol_coingecko() -> Optional[str]:
-    """
-    Find the highest market cap coin with ticker HYPE on CoinGecko.
-    """
     global CG_IDS_CACHE
     try:
         if CG_IDS_CACHE is None:
@@ -156,7 +152,6 @@ def resolve_hype_symbol_coingecko() -> Optional[str]:
         ids = CG_IDS_CACHE.get("HYPE", [])
         if not ids:
             return None
-        # fetch markets to sort by market cap
         best_id, best_mcap = None, -1
         for cid in ids:
             try:
@@ -175,6 +170,7 @@ def resolve_hype_symbol_coingecko() -> Optional[str]:
     except Exception as e:
         record_failure("resolve_hype", str(e))
         return None
+
 
 def get_price_primary(coin: str) -> Optional[dict]:
     """
@@ -243,21 +239,16 @@ def get_price_primary(coin: str) -> Optional[dict]:
             return None
 
 def get_price_fallback(coin: str) -> Optional[dict]:
-    """
-    Fallback: CoinGecko
-    """
     try:
         global CG_IDS_CACHE
         if CG_IDS_CACHE is None:
             CG_IDS_CACHE = get_coin_ids_map()
 
-        # Resolve ID
         if coin == "HYPE":
             cid = resolve_hype_symbol_coingecko()
             if not cid:
                 return None
         else:
-            # map symbol -> maybe multiple ids; choose canonical (bitcoin, ethereum, solana)
             canonical = {"BTC":"bitcoin", "ETH":"ethereum", "SOL":"solana"}
             cid = canonical.get(coin)
             if not cid:
@@ -284,9 +275,6 @@ def get_price_fallback(coin: str) -> Optional[dict]:
         return None
 
 def get_technicals_via_coingecko(coin: str) -> Tuple[Optional[float], Optional[float], Optional[float]]:
-    """
-    Attempts to compute RSI(14), SMA20, SMA50 from CoinGecko market_chart (hourly).
-    """
     try:
         if coin == "HYPE":
             cid = resolve_hype_symbol_coingecko()
@@ -306,7 +294,6 @@ def get_technicals_via_coingecko(coin: str) -> Tuple[Optional[float], Optional[f
         s = pd.Series(closes, dtype=float)
         sma20 = float(s.rolling(20).mean().iloc[-1])
         sma50 = float(s.rolling(50).mean().iloc[-1])
-        # RSI
         delta = s.diff()
         up = delta.clip(lower=0)
         down = -1*delta.clip(upper=0)
