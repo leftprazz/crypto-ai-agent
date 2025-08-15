@@ -45,6 +45,7 @@ CMC_API_KEY = os.getenv("CMC_API_KEY", "")
 CG_API_BASE = os.getenv("COINGECKO_API_BASE", "https://api.coingecko.com/api/v3")
 TWITTER_BEARER = os.getenv("TWITTER_BEARER_TOKEN", "")
 NEWSAPI_KEY = os.getenv("NEWSAPI_KEY", "")
+CG_API_KEY = os.getenv("COINGECKO_API_KEY", "")
 
 SMTP_HOST = os.getenv("SMTP_HOST", "")
 SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
@@ -114,13 +115,23 @@ def backoff_delays():
 
 # ---------------------------- Data Sources ----------------------------
 
+# CoinGecko request helper with API key header
+def cg_get(path: str, params: dict | None = None):
+    headers = {}
+    if CG_API_KEY:
+        # CoinGecko accepts this header for API keys (free/pro)
+        headers["x-cg-demo-api-key"] = CG_API_KEY
+    url = f"{CG_API_BASE}{path}"
+    r = requests.get(url, params=params or {}, headers=headers, timeout=20)
+    r.raise_for_status()
+    return r
+
 def get_coin_ids_map() -> Dict[str, str]:
     """
     Resolve tickers to CoinGecko IDs for fallback/technicals.
     """
     try:
-        r = requests.get(f"{CG_API_BASE}/coins/list", timeout=20)
-        r.raise_for_status()
+        r = cg_get("/coins/list")
         data = r.json()
         # map symbol -> list of ids with that symbol
         by_symbol = {}
@@ -149,9 +160,10 @@ def resolve_hype_symbol_coingecko() -> Optional[str]:
         best_id, best_mcap = None, -1
         for cid in ids:
             try:
-                r = requests.get(f"{CG_API_BASE}/coins/{cid}", params={"localization":"false","tickers":"false","market_data":"true","community_data":"false","developer_data":"false","sparkline":"false"}, timeout=20)
-                if r.status_code != 200:
-                    continue
+                r = cg_get(f"/coins/{cid}", {
+                    "localization":"false","tickers":"false","market_data":"true",
+                    "community_data":"false","developer_data":"false","sparkline":"false"
+                })
                 md = r.json().get("market_data",{})
                 mcap = md.get("market_cap",{}).get("usd")
                 if mcap is not None and mcap > best_mcap:
@@ -254,8 +266,7 @@ def get_price_fallback(coin: str) -> Optional[dict]:
                     return None
                 cid = ids[0]
 
-        r = requests.get(f"{CG_API_BASE}/coins/markets", params={"vs_currency":"usd","ids":cid}, timeout=20)
-        r.raise_for_status()
+        r = cg_get("/coins/markets", {"vs_currency":"usd","ids":cid})
         arr = r.json()
         if not arr:
             return None
@@ -287,8 +298,7 @@ def get_technicals_via_coingecko(coin: str) -> Tuple[Optional[float], Optional[f
             if not cid:
                 return (None, None, None)
 
-        r = requests.get(f"{CG_API_BASE}/coins/{cid}/market_chart", params={"vs_currency":"usd","days":"2","interval":"hourly"}, timeout=20)
-        r.raise_for_status()
+        r = cg_get(f"/coins/{cid}/market_chart", {"vs_currency":"usd","days":"2","interval":"hourly"})
         prices = r.json().get("prices", [])
         closes = [p[1] for p in prices]
         if len(closes) < 50:
@@ -344,19 +354,27 @@ def fetch_twitter_texts(query: str, limit: int = 50) -> List[str]:
         except Exception as e:
             record_failure("twitter_api", str(e))
             return []
-    # fallback to snscrape
+    # fallback to snscrape CLI
     try:
         import subprocess, json as _json
-        cmd = ["python", "-m", "snscrape", "--jsonl", "--max-results", str(limit),
-               "twitter-search", f"{query} lang:en since_time:{int((datetime.now(timezone.utc)-timedelta(hours=24)).timestamp())}"]
-        out = subprocess.check_output(cmd, text=True)
+        since_ts = int((datetime.now(timezone.utc)-timedelta(hours=24)).timestamp())
+        cmd = ["snscrape", "--jsonl", "--max-results", str(limit),
+               "twitter-search", f"{query} lang:en since_time:{since_ts}"]
+        try:
+            out = subprocess.check_output(cmd, text=True)
+        except Exception:
+            # last-ditch: older module runner path
+            cmd = ["python", "-m", "snscrape.cli", "--jsonl", "--max-results", str(limit),
+                   "twitter-search", f"{query} lang:en since_time:{since_ts}"]
+            out = subprocess.check_output(cmd, text=True)
+
         texts = []
         seen = set()
         for line in out.splitlines():
             obj = _json.loads(line)
             content = obj.get("content","")
             h = hashlib.sha1(content.encode("utf-8")).hexdigest()
-            if h in seen: 
+            if h in seen:
                 continue
             seen.add(h)
             texts.append(content)
