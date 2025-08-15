@@ -122,14 +122,44 @@ def backoff_delays():
 
 # CoinGecko request helper with API key header
 def cg_get(path: str, params: dict | None = None):
-    headers = {}
-    if CG_API_KEY:
-        headers["x-cg-pro-api-key"] = CG_API_KEY
-        headers["x-cg-demo-api-key"] = CG_API_KEY
     url = f"{CG_API_BASE}{path}"
-    r = requests.get(url, params=params or {}, headers=headers, timeout=20)
-    r.raise_for_status()
-    return r
+    params = params or {}
+    # coba DEMO dulu kalau ada key
+    if CG_API_KEY:
+        # 1) DEMO
+        try:
+            r = requests.get(url, params=params,
+                             headers={"x-cg-demo-api-key": CG_API_KEY},
+                             timeout=20)
+            if r.status_code < 400:
+                return r
+            # log body untuk debug
+            record_failure("coingecko_http", f"{r.status_code} {url} :: {r.text[:200]}")
+        except requests.HTTPError as e:
+            record_failure("coingecko_http", f"{e} {url}")
+        except Exception as e:
+            record_failure("coingecko_req", f"{e} {url}")
+
+        # 2) PRO (kalau ternyata key kamu pro)
+        try:
+            r = requests.get(url, params=params,
+                             headers={"x-cg-pro-api-key": CG_API_KEY},
+                             timeout=20)
+            if r.status_code >= 400:
+                record_failure("coingecko_http", f"{r.status_code} {url} :: {r.text[:200]}")
+            r.raise_for_status()
+            return r
+        except Exception as e:
+            record_failure("coingecko_req", f"{e} {url}")
+            raise
+    else:
+        # tanpa key (public) — bisa rate/limits
+        r = requests.get(url, params=params, timeout=20)
+        if r.status_code >= 400:
+            record_failure("coingecko_http", f"{r.status_code} {url} :: {r.text[:200]}")
+        r.raise_for_status()
+        return r
+
 
 def get_coin_ids_map() -> Dict[str, str]:
     try:
