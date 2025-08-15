@@ -12,13 +12,13 @@ RUN pip wheel --no-cache-dir -r requirements.txt -w /wheels
 FROM python:3.11-slim
 ENV PYTHONUNBUFFERED=1 PIP_NO_CACHE_DIR=1
 WORKDIR /app
-# CA bundle for runtime SSL (snscrape/requests)
+# CA untuk runtime SSL (requests/snscrape)
 RUN apt-get update \
  && apt-get install -y --no-install-recommends ca-certificates \
  && update-ca-certificates \
  && rm -rf /var/lib/apt/lists/*
-COPY requirements.txt .
 COPY --from=builder /wheels /wheels
-RUN pip install --no-cache-dir --no-index --find-links=/wheels -r requirements.txt
+# ⬇️ HANYA pasang wheel; tidak membaca requirements.txt lagi
+RUN pip install --no-cache-dir /wheels/*.whl
 COPY . .
 CMD ["python", "main.py"]
