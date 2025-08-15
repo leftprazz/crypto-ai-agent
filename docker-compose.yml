@@ -1,0 +1,12 @@
+services:
+  agent:
+    build: .
+    container_name: crypto-alert-agent
+    env_file: .env
+    restart: unless-stopped
+    volumes:
+      - sqlite_data:/app/data
+    tty: true
+
+volumes:
+  sqlite_data:
