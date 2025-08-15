@@ -33,6 +33,7 @@ from dotenv import load_dotenv
 load_dotenv()
 os.environ["SSL_CERT_FILE"] = certifi.where()
 os.environ["REQUESTS_CA_BUNDLE"] = certifi.where()
+DISABLE_TWITTER_SCRAPE = os.getenv("DISABLE_TWITTER_SCRAPE", "0") in ("1", "true", "True")
 
 # ---------------------------- Config ----------------------------
 
@@ -123,7 +124,6 @@ def backoff_delays():
 def cg_get(path: str, params: dict | None = None):
     headers = {}
     if CG_API_KEY:
-        # kirim dua-duanya; CG akan terima salah satunya sesuai tier
         headers["x-cg-pro-api-key"] = CG_API_KEY
         headers["x-cg-demo-api-key"] = CG_API_KEY
     url = f"{CG_API_BASE}{path}"
@@ -324,15 +324,12 @@ def score_texts(texts: List[str]) -> Tuple[float, float]:
     return (mean, conf)
 
 def fetch_twitter_texts(query: str, limit: int = 50) -> List[str]:
+    # 1) Coba API resmi jika ada token
     headers = {"Authorization": f"Bearer {TWITTER_BEARER}"} if TWITTER_BEARER else None
     if headers:
         try:
             url = "https://api.twitter.com/2/tweets/search/recent"
-            params = {
-                "query": f"{query} -is:retweet lang:en",
-                "max_results": min(100, limit),
-                "tweet.fields": "created_at,lang"
-            }
+            params = {"query": f"{query} -is:retweet lang:en", "max_results": min(100, limit), "tweet.fields": "created_at,lang"}
             r = requests.get(url, params=params, headers=headers, timeout=20)
             if r.status_code == 429:
                 record_failure("twitter_rate", r.text[:200])
@@ -344,13 +341,16 @@ def fetch_twitter_texts(query: str, limit: int = 50) -> List[str]:
             record_failure("twitter_api", str(e))
             return []
 
-    # Fallback: CLI snscrape sekali saja
+    # 2) Jika diminta disable, langsung skip biar tidak error beruntun
+    if DISABLE_TWITTER_SCRAPE:
+        return []
+
+    # 3) Fallback snscrape CLI sekali; jika gagal (blocked/SSL), jangan retry ke -m snscrape.cli
     try:
-        import subprocess, json as _json
+        import subprocess, json as _json, hashlib
         since_ts = int((datetime.now(timezone.utc)-timedelta(hours=24)).timestamp())
-        cmd = ["snscrape", "--jsonl", "--max-results", str(limit),
-               "twitter-search", f"{query} lang:en since_time:{since_ts}"]
-        out = subprocess.check_output(cmd, text=True)
+        cmd = ["snscrape", "--jsonl", "--max-results", str(limit), "twitter-search", f"{query} lang:en since_time:{since_ts}"]
+        out = subprocess.check_output(cmd, text=True, timeout=25)
         texts, seen = [], set()
         for line in out.splitlines():
             obj = _json.loads(line)
@@ -362,10 +362,9 @@ def fetch_twitter_texts(query: str, limit: int = 50) -> List[str]:
             texts.append(content)
         return texts
     except Exception as e:
-        # stop di sini, jangan fallback -m snscrape.cli lagi
-        record_failure("snscrape", str(e))
+        # contoh pesan “blocked (404)” → catat 1x dan lanjut tanpa twitter
+        record_failure("snscrape", str(e)[:300])
         return []
-
 
 def fetch_news_texts(coin: str, limit: int = 20) -> Tuple[List[str], List[str]]:
     """
