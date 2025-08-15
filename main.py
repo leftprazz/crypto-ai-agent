@@ -7,8 +7,9 @@ Crypto Alert Agent
 - Sends daily digest at 23:50 Asia/Jakarta
 """
 
-import os, time, math, json, smtplib, logging, hashlib
+import os, time, math, json, smtplib, logging, hashlib, html
 from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 from dataclasses import dataclass, asdict
@@ -133,7 +134,6 @@ def cg_get(path: str, params: dict | None = None):
                              timeout=20)
             if r.status_code < 400:
                 return r
-            # log body untuk debug
             record_failure("coingecko_http", f"{r.status_code} {url} :: {r.text[:200]}")
         except requests.HTTPError as e:
             record_failure("coingecko_http", f"{e} {url}")
@@ -214,7 +214,6 @@ def get_price_primary(coin: str) -> Optional[dict]:
         return None
     symbol = coin
     if coin == "HYPE":
-        # CMC lookup by symbol, pick largest market cap
         try:
             url = "https://pro-api.coinmarketcap.com/v1/cryptocurrency/map"
             r = requests.get(url, params={"symbol":"HYPE"}, headers={"X-CMC_PRO_API_KEY": CMC_API_KEY}, timeout=20)
@@ -222,7 +221,6 @@ def get_price_primary(coin: str) -> Optional[dict]:
             data = r.json().get("data", [])
             if not data:
                 return None
-            # For map results, we need quotes to get mcap; fetch quotes for all ids then choose largest mcap
             ids = [str(d["id"]) for d in data if d.get("symbol","").upper()=="HYPE"]
             if not ids:
                 return None
@@ -321,8 +319,8 @@ def get_technicals_via_coingecko(coin: str) -> Tuple[Optional[float], Optional[f
 
         r = cg_get(f"/coins/{cid}/market_chart", {
             "vs_currency": "usd",
-            "days": "90",         # cukup untuk SMA50 & RSI14 harian
-            "interval": "daily"   # atau hapus param interval sekalian (auto-daily)
+            "days": "90",
+            "interval": "daily"
         })
         prices = r.json().get("prices", [])
         closes = [p[1] for p in prices]
@@ -358,7 +356,6 @@ def score_texts(texts: List[str]) -> Tuple[float, float]:
     return (mean, conf)
 
 def fetch_twitter_texts(query: str, limit: int = 50) -> List[str]:
-    # 1) Coba API resmi jika ada token
     headers = {"Authorization": f"Bearer {TWITTER_BEARER}"} if TWITTER_BEARER else None
     if headers:
         try:
@@ -375,11 +372,9 @@ def fetch_twitter_texts(query: str, limit: int = 50) -> List[str]:
             record_failure("twitter_api", str(e))
             return []
 
-    # 2) Jika diminta disable, langsung skip biar tidak error beruntun
     if DISABLE_TWITTER_SCRAPE:
         return []
 
-    # 3) Fallback snscrape CLI sekali; jika gagal (blocked/SSL), jangan retry ke -m snscrape.cli
     try:
         import subprocess, json as _json, hashlib
         since_ts = int((datetime.now(timezone.utc)-timedelta(hours=24)).timestamp())
@@ -396,14 +391,10 @@ def fetch_twitter_texts(query: str, limit: int = 50) -> List[str]:
             texts.append(content)
         return texts
     except Exception as e:
-        # contoh pesan “blocked (404)” → catat 1x dan lanjut tanpa twitter
         record_failure("snscrape", str(e)[:300])
         return []
 
 def fetch_news_texts(coin: str, limit: int = 20) -> Tuple[List[str], List[str]]:
-    """
-    Returns (texts, headlines) for the last 24h.
-    """
     q_terms = {
         "BTC": ["Bitcoin"],
         "ETH": ["Ethereum"],
@@ -432,7 +423,6 @@ def fetch_news_texts(coin: str, limit: int = 20) -> Tuple[List[str], List[str]]:
             return texts, headlines[:5]
         except Exception as e:
             record_failure("newsapi", str(e))
-    # Fallback: Google News RSS
     try:
         q = " OR ".join(terms)
         feed = feedparser.parse(f"https://news.google.com/rss/search?q={q.replace(' ', '%20')}&hl=en-US&gl=US&ceid=US:en")
@@ -463,28 +453,21 @@ class SentimentBlock:
     news: Dict = None
 
 def compute_sentiment(coin: str) -> SentimentBlock:
-    # Twitter
     tw_texts = []
     for term in [coin, {"BTC":"Bitcoin","ETH":"Ethereum","SOL":"Solana"}.get(coin, coin)]:
         tw_texts.extend(fetch_twitter_texts(str(term), limit=40))
-    tw_texts = list({t:1 for t in tw_texts}.keys())  # de-dupe
+    tw_texts = list({t:1 for t in tw_texts}.keys())
     tw_score, tw_conf = score_texts(tw_texts)
-    # News
     news_texts, headlines = fetch_news_texts(coin, limit=20)
     news_score, news_conf = score_texts(news_texts)
-    # Composite (weighted by confidence and source presence)
-    weights = []
-    comps = []
+    weights, comps = [], []
     if tw_texts:
         weights.append(max(0.01, tw_conf))
         comps.append(tw_score)
     if news_texts:
         weights.append(max(0.01, news_conf))
         comps.append(news_score)
-    if not weights:
-        composite = 0.0
-    else:
-        composite = float(np.average(comps, weights=weights))
+    composite = 0.0 if not weights else float(np.average(comps, weights=weights))
     return SentimentBlock(
         composite=composite,
         twitter_x={"score": tw_score, "confidence": tw_conf, "sample_size": len(tw_texts)},
@@ -492,10 +475,6 @@ def compute_sentiment(coin: str) -> SentimentBlock:
     )
 
 def should_alert(coin: str, change_24h_pct: float, current_price: float) -> Tuple[bool, int, Optional[float]]:
-    """
-    Returns (should_alert, step, baseline_price_if_first).
-    step = 1 for +2%, 2 for +4%, etc.
-    """
     if change_24h_pct is None or current_price is None:
         return (False, 0, None)
     if change_24h_pct < MIN_ALERT_STEP_PCT:
@@ -511,13 +490,11 @@ def should_alert(coin: str, change_24h_pct: float, current_price: float) -> Tupl
                 last_dt = datetime.fromisoformat(last_alert_ts)
                 if (now_ts - last_dt) < timedelta(minutes=COOLDOWN_MINUTES):
                     return (False, 0, None)
-            # compute step
             step = int(change_24h_pct // MIN_ALERT_STEP_PCT)
             if step <= (row["last_step"] or 0):
                 return (False, 0, None)
             return (True, step, None)
         else:
-            # first alert today
             step = int(change_24h_pct // MIN_ALERT_STEP_PCT)
             if step < 1:
                 return (False, 0, None)
@@ -540,13 +517,9 @@ def update_alert_state(coin: str, step: int, baseline_price: Optional[float] = N
 
 def decide_entry(change_24h_pct: float, sentiment: SentimentBlock, price: float,
                  tech: Technicals, volume_24h: Optional[float], vol_vs_30d: Optional[float]=None) -> Tuple[str, str]:
-    """
-    Returns (decision, rationale)
-    """
     consider = False
     reasons = []
     if change_24h_pct is not None and change_24h_pct >= 2.0:
-        # sentiment or volume or SMA filter
         if sentiment.composite >= 0.15:
             consider = True
             reasons.append(f"composite sentiment {sentiment.composite:+.2f}")
@@ -563,9 +536,113 @@ def decide_entry(change_24h_pct: float, sentiment: SentimentBlock, price: float,
         rationale = "Positive price move but lacking confirming sentiment/volume/MA trend; skipping for now."
         return "No Entry", rationale
 
-# ---------------------------- Email ----------------------------
+# ---------------------------- Email helpers ----------------------------
 
+def build_alert_email_html(coin: str, info: dict, decision: str, rationale: str, ts_local: str) -> str:
+    pct = info["change_24h_pct"]
+    price = info["price"]
+    vol = info["volume_24h"]
+    rsi = info["technicals"].rsi14
+    sma20 = info["technicals"].sma20
+    sma50 = info["technicals"].sma50
+    sent = info["sentiment"]
+    headlines = sent.news.get("top_headlines", []) if sent and sent.news else []
+
+    # small helpers
+    def fmt_money(x):
+        return "-" if x in (None, "") else f"${x:,.2f}"
+    def fmt_num(x, nd=2):
+        return "-" if x in (None, "") else f"{x:.{nd}f}"
+
+    raw_json = html.escape(json.dumps({
+        "coin": coin,
+        "price": price,
+        "change_24h_pct": pct,
+        "volume_24h": vol,
+        "technicals": {"rsi14": rsi, "sma20": sma20, "sma50": sma50},
+        "sentiment": {
+            "composite": sent.composite if sent else None,
+            "twitter_x": sent.twitter_x if sent else None,
+            "news": sent.news if sent else None
+        },
+        "decision": decision,
+        "rationale": rationale
+    }, ensure_ascii=False, indent=2))
+
+    return f"""
+<!doctype html>
+<html>
+  <body style="font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif; color:#0f172a; background:#ffffff; padding:16px;">
+    <div style="max-width:640px;margin:auto;border:1px solid #e5e7eb;border-radius:12px;padding:20px;">
+      <h2 style="margin:0 0 8px 0;">🚀 Crypto Price Alert</h2>
+      <div style="font-size:14px;color:#64748b;">{ts_local} (Asia/Jakarta)</div>
+
+      <hr style="border:none;border-top:1px solid #e5e7eb;margin:16px 0;" />
+
+      <table role="presentation" cellpadding="0" cellspacing="0" style="width:100%;font-size:15px;line-height:1.5;">
+        <tr>
+          <td style="padding:6px 0;width:40%;color:#64748b;">Coin</td>
+          <td style="padding:6px 0;"><strong>{coin}</strong></td>
+        </tr>
+        <tr>
+          <td style="padding:6px 0;color:#64748b;">Current Price</td>
+          <td style="padding:6px 0;"><strong>{fmt_money(price)}</strong> <span style="color:#64748b;">USD</span></td>
+        </tr>
+        <tr>
+          <td style="padding:6px 0;color:#64748b;">Change (24h)</td>
+          <td style="padding:6px 0;"><strong>{fmt_num(pct, 2)}%</strong></td>
+        </tr>
+        <tr>
+          <td style="padding:6px 0;color:#64748b;">Volume (24h)</td>
+          <td style="padding:6px 0;">{fmt_money(vol)} <span style="color:#64748b;">USD</span></td>
+        </tr>
+      </table>
+
+      <h3 style="margin:16px 0 8px 0;">📊 Technicals</h3>
+      <ul style="margin:0 0 12px 18px;padding:0;">
+        <li>RSI(14): <strong>{fmt_num(rsi, 2)}</strong></li>
+        <li>SMA20: <strong>{fmt_num(sma20, 4)}</strong></li>
+        <li>SMA50: <strong>{fmt_num(sma50, 4)}</strong></li>
+      </ul>
+
+      <h3 style="margin:16px 0 8px 0;">🧠 Decision</h3>
+      <div><strong>{decision}</strong></div>
+      <div style="color:#334155;margin-top:4px;">{html.escape(rationale)}</div>
+
+      <h3 style="margin:16px 0 8px 0;">📰 Top Headlines</h3>
+      {"<div style='color:#64748b;'>No fresh headlines.</div>" if not headlines else ""}
+      <ol style="margin:0 0 12px 18px;padding:0;">
+        {"".join(f"<li>{html.escape(h)}</li>" for h in headlines)}
+      </ol>
+
+      <details style="margin-top:12px;">
+        <summary style="cursor:pointer;color:#2563eb;">Show raw JSON</summary>
+        <pre style="white-space:pre-wrap;background:#0f172a;color:#e2e8f0;padding:12px;border-radius:8px;font-size:12px;">{raw_json}</pre>
+      </details>
+
+      <p style="color:#64748b;font-size:12px;margin-top:16px;">This is not financial advice. Do your own research.</p>
+    </div>
+  </body>
+</html>
+    """.strip()
+
+def send_email_multipart(subject: str, plain_text: str, html_body: str):
+    """Send multipart email (text + html)."""
+    msg = MIMEMultipart("alternative")
+    msg["Subject"] = subject
+    msg["From"] = EMAIL_FROM
+    msg["To"] = EMAIL_TO
+    msg.attach(MIMEText(plain_text, "plain"))
+    msg.attach(MIMEText(html_body, "html"))
+    with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=20) as server:
+        server.starttls()
+        if SMTP_USER:
+            server.login(SMTP_USER, SMTP_PASS)
+        server.sendmail(EMAIL_FROM, [EMAIL_TO], msg.as_string())
+
+# (keperluan lain tetap tersedia)
 def send_email(subject: str, body_json: dict):
+    """Legacy single-part JSON (dipakai untuk kebutuhan lain kalau mau)."""
     msg = MIMEText(json.dumps(body_json, ensure_ascii=False, indent=2))
     msg["Subject"] = subject
     msg["From"] = EMAIL_FROM
@@ -675,11 +752,9 @@ def tick():
             should, step, baseline_price = should_alert(coin, info["change_24h_pct"], info["price"])
             if not should:
                 pct = info.get("change_24h_pct")
-                # Log spesifik sesuai permintaan
                 if pct is None or pct < MIN_ALERT_STEP_PCT:
                     logging.info(f"[{coin}] Skipping email alert — price change below threshold ({(pct or 0):.2f}%)")
                 else:
-                    # (opsional) info tambahan: kasus cooldown atau belum melewati step baru
                     logging.info(f"[{coin}] Skipping email alert — cooldown/new step not met")
                 continue
 
@@ -688,7 +763,13 @@ def tick():
                 info["technicals"], info["volume_24h"], None
             )
             subject, payload = make_email_payload(coin, info, decision, rationale)
-            send_email(subject, payload)
+
+            # NEW: kirim multipart (text + HTML)
+            ts_local = now_local().strftime("%Y-%m-%d %H:%M")
+            html_body = build_alert_email_html(coin, info, decision, rationale, ts_local)
+            plain_text = json.dumps(payload, ensure_ascii=False, indent=2)
+            send_email_multipart(subject, plain_text, html_body)
+
             update_alert_state(coin, step, baseline_price)
             logging.info(f"Alert sent for {coin}: step {step}, decision={decision}")
         except Exception as e:
@@ -698,17 +779,14 @@ def tick():
 def daily_digest():
     try:
         date_k = today_key()
-        # Ambil semua koin dari daftar COINS, walau belum ada alert hari ini
         with ENGINE.begin() as conn:
             rows = conn.execute(
                 text("SELECT coin, last_step FROM alerts WHERE date_key=:d"),
                 {"d": date_k}
             ).mappings().all()
 
-        # Buat dictionary untuk akses cepat
         step_map = {r["coin"]: r["last_step"] for r in rows}
 
-        # Buat tabel ringkas
         lines = []
         lines.append(f"Daily Digest — {now_local().strftime('%Y-%m-%d %H:%M')} Asia/Jakarta")
         lines.append("")
@@ -723,10 +801,8 @@ def daily_digest():
             )
             lines.append(f"{coin:<6} {str(last_step):<10} {note}")
 
-        # Gabungkan jadi body plain text
         body_text = "\n".join(lines)
 
-        # Kirim email plain text
         msg = MIMEText(body_text, "plain")
         subject = f"[DIGEST] Summary — {now_local().strftime('%Y-%m-%d %H:%M')} Asia/Jakarta"
         msg["Subject"] = subject
@@ -746,9 +822,7 @@ def daily_digest():
 def main():
     logging.info("Starting Crypto Alert Agent…")
     scheduler = BackgroundScheduler(timezone=str(TZ))
-    # periodic tick
     scheduler.add_job(tick, IntervalTrigger(minutes=REFRESH_MINUTES, timezone=str(TZ)), max_instances=1, coalesce=True)
-    # daily digest at HH:MM local
     hh, mm = map(int, DAILY_DIGEST_LOCALTIME.split(":"))
     scheduler.add_job(daily_digest, CronTrigger(hour=hh, minute=mm, timezone=str(TZ)), max_instances=1, coalesce=True)
     scheduler.start()
