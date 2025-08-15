@@ -52,7 +52,7 @@ SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
 SMTP_USER = os.getenv("SMTP_USER", "")
 SMTP_PASS = os.getenv("SMTP_PASS", "")
 EMAIL_TO = os.getenv("EMAIL_TO", "")
-EMAIL_FROM = os.getenv("EMAIL_FROM", "Crypto Alerts <alerts@example.com>")
+EMAIL_FROM = os.getenv("EMAIL_FROM", "Crypto Alerts <crypto-agent@leftprazz.com>")
 
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s [%(levelname)s] %(message)s")
