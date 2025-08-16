@@ -35,6 +35,17 @@ load_dotenv()
 os.environ["SSL_CERT_FILE"] = certifi.where()
 os.environ["REQUESTS_CA_BUNDLE"] = certifi.where()
 
+# ---------------------------- WA / Seender Config ----------------------------
+WA_ENABLE = os.getenv("WA_ENABLE", "0").lower() in ("1", "true", "yes")
+SEENDER_API_KEY = os.getenv("SEENDER_API_KEY", "")
+WA_SENDER_DEFAULT = os.getenv("WA_SENDER_DEFAULT", "")
+# Bisa 1 atau banyak nomor, pakai koma
+WA_NUMBERS = [x.strip() for x in os.getenv("WA_NUMBERS", os.getenv("WA_NUMBER_DEFAULT","")).split(",") if x.strip()]
+WA_FOOTER_DEFAULT = os.getenv("WA_FOOTER_DEFAULT", "Crypto Alert Bot")
+WA_PREFER_GET = os.getenv("WA_PREFER_GET", "1").lower() in ("1","true","yes")
+WA_TIMEOUT = int(os.getenv("WA_TIMEOUT", "15"))
+WA_SEND_DIGEST = os.getenv("WA_SEND_DIGEST", "0").lower() in ("1","true","yes")
+
 # Twitter
 DISABLE_TWITTER_SCRAPE = os.getenv("DISABLE_TWITTER_SCRAPE", "0") in ("1", "true", "True")
 # ==== X / Twitter quota config ====
@@ -795,6 +806,125 @@ def send_email(subject: str, body_json: dict):
             server.login(SMTP_USER, SMTP_PASS)
         server.sendmail(EMAIL_FROM, [EMAIL_TO], msg.as_string())
 
+# ---------------------------- WhatsApp helpers (seender.web.id) ----------------------------
+def send_whatsapp_seender(*, api_key: str, sender: str, number: str, message: str, footer: str,
+                          prefer_get: bool = True, timeout: int = 15) -> dict:
+    """
+    Kirim WA via seender.web.id sesuai panduan:
+      - Endpoint: https://seender.web.id/send-message
+      - Body: api_key, sender, number, message, footer
+    prefer_get=True => pakai GET (sering lebih stabil); jika gagal, fallback ke POST.
+    Return: dict (hasil parse JSON). Tidak lempar exception (agar non-blocking).
+    """
+    url = "https://seender.web.id/send-message"
+    params = {
+        "api_key": api_key,
+        "sender": sender,
+        "number": number,
+        "message": message,
+        "footer": footer
+    }
+    try:
+        if prefer_get:
+            r = requests.get(url, params=params, timeout=timeout)
+            try:
+                return r.json()
+            except Exception:
+                return {"status": False, "msg": f"Non-JSON GET response: {r.text[:200]}"}
+        else:
+            r = requests.post(url, json=params, timeout=timeout)
+            try:
+                return r.json()
+            except Exception:
+                return {"status": False, "msg": f"Non-JSON POST response: {r.text[:200]}"}
+    except Exception as e:
+        # fallback: coba metode lain sekali
+        try:
+            if prefer_get:
+                r = requests.post(url, json=params, timeout=timeout)
+            else:
+                r = requests.get(url, params=params, timeout=timeout)
+            try:
+                return r.json()
+            except Exception:
+                return {"status": False, "msg": f"Fallback non-JSON: {r.text[:200]}"}
+        except Exception as e2:
+            return {"status": False, "msg": f"Error: {e2}"}
+
+def _build_wa_alert_message(coin: str, info: dict, decision: str, rationale: str) -> str:
+    pct = info.get("change_24h_pct")
+    price = info.get("price")
+    sent = info.get("sentiment")
+    ts = now_local().strftime("%Y-%m-%d %H:%M %Z")
+    comp = (sent.composite if sent else 0.0) or 0.0
+    return (
+        f"🚨 Crypto Price Alert — {coin}\n"
+        f"{ts}\n"
+        f"Price: ${price:,.4f} | 24h: {pct:.2f}%\n"
+        f"Decision: {decision}\n"
+        f"Sentiment: {comp:+.2f}\n"
+        f"Note: {rationale}"
+    )
+
+def _safe_send_wa_alert(coin: str, info: dict, decision: str, rationale: str):
+    """
+    Non-blocking WA send:
+    - Jika variabel WA tidak lengkap/disabled => log INFO dan selesai.
+    - Jika gagal kirim ke salah satu/multiple nomor => log INFO (tidak raise).
+    """
+    if not WA_ENABLE:
+        logging.info("[WA] Disabled (WA_ENABLE=false)")
+        return
+    if not (SEENDER_API_KEY and WA_SENDER_DEFAULT and WA_NUMBERS):
+        logging.info("[WA] Missing config (SEENDER_API_KEY/WA_SENDER_DEFAULT/WA_NUMBERS)")
+        return
+
+    message = _build_wa_alert_message(coin, info, decision, rationale)
+    for num in WA_NUMBERS:
+        try:
+            resp = send_whatsapp_seender(
+                api_key=SEENDER_API_KEY,
+                sender=WA_SENDER_DEFAULT,
+                number=num,
+                message=message,
+                footer=WA_FOOTER_DEFAULT,
+                prefer_get=WA_PREFER_GET,
+                timeout=WA_TIMEOUT,
+            )
+            # Jangan mengganggu alur: hanya log
+            ok = str(resp.get("status", "")).lower() in ("true", "1", "ok", "success")
+            if ok:
+                logging.info(f"[WA] Sent to {num} :: {resp}")
+            else:
+                logging.info(f"[WA] Failed to {num} :: {resp}")
+        except Exception as e:
+            logging.info(f"[WA] Exception sending to {num}: {e}")
+
+def _safe_send_wa_digest(text_body: str):
+    """Opsional digest via WA; tetap non-blocking."""
+    if not (WA_ENABLE and WA_SEND_DIGEST):
+        return
+    if not (SEENDER_API_KEY and WA_SENDER_DEFAULT and WA_NUMBERS):
+        logging.info("[WA][Digest] Missing config")
+        return
+    title = f"🗞️ Daily Digest — {now_local().strftime('%Y-%m-%d %H:%M %Z')}"
+    message = f"{title}\n\n{text_body}"
+    for num in WA_NUMBERS:
+        try:
+            resp = send_whatsapp_seender(
+                api_key=SEENDER_API_KEY,
+                sender=WA_SENDER_DEFAULT,
+                number=num,
+                message=message,
+                footer=WA_FOOTER_DEFAULT,
+                prefer_get=WA_PREFER_GET,
+                timeout=WA_TIMEOUT,
+            )
+            ok = str(resp.get("status", "")).lower() in ("true", "1", "ok", "success")
+            logging.info(f"[WA][Digest] {'Sent' if ok else 'Failed'} to {num} :: {resp}")
+        except Exception as e:
+            logging.info(f"[WA][Digest] Exception to {num}: {e}")
+
 # ---------------------------- Core Tick ----------------------------
 
 def fetch_all_for_coin(coin: str) -> Optional[dict]:
@@ -935,6 +1065,13 @@ def tick():
             html_body = build_alert_email_html(coin, info, decision, rationale, ts_local)
             send_email_multipart(subject, plain_text, html_body)
 
+            # --- Kirim WhatsApp (non-blocking)
+            try:
+                _safe_send_wa_alert(coin, info, decision, rationale)
+            except Exception as _:
+                # absolutely non-blocking
+                logging.info("[WA] Unexpected error in WA sender; ignored")
+
             # Update state alert (cooldown/step)
             update_alert_state(coin, step, baseline_price)
             logging.info(f"Alert sent for {coin}: step {step}, decision={decision}")
@@ -984,9 +1121,13 @@ def daily_digest():
             server.sendmail(EMAIL_FROM, [EMAIL_TO], msg.as_string())
 
         logging.info("Daily digest sent.")
+        # Opsional: kirim digest via WA (non-blocking)
+        try:
+            _safe_send_wa_digest(body_text)
+        except Exception as _:
+            logging.info("[WA][Digest] Unexpected error; ignored")
     except Exception as e:
         record_failure("daily_digest", str(e))
-
 
 def main():
     logging.info("Starting Crypto Alert Agent…")
