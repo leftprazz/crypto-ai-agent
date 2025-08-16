@@ -112,8 +112,10 @@ CREATE INDEX IF NOT EXISTS ix_xquota_month ON x_quota(month_key);
 """
 
 with ENGINE.begin() as conn:
-    for stmt in SCHEMA_SQL.strip().split(";\n\n"):
-        if stmt.strip():
+    # Pecah di setiap ';' agar selalu satu statement per execute
+    for stmt in SCHEMA_SQL.strip().split(";"):
+        stmt = stmt.strip()
+        if stmt:
             conn.execute(text(stmt))
 
 # ---------------------------- Utilities ----------------------------
