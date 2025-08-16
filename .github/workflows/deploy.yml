@@ -1,0 +1,39 @@
+name: Deploy to VM
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: prod
+    env:
+      SSH_HOST: ${{ vars.SSH_HOST }}
+      SSH_USER: ${{ vars.SSH_USER }}
+      SSH_KEY_B64: ${{ vars.SSH_KEY }} # disimpan di vars dalam format base64
+      SSH_PORT: ${{ vars.SSH_PORT }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Decode SSH Key
+        run: |
+          echo "$SSH_KEY_B64" | base64 -d > private_key
+          chmod 600 private_key
+
+      - name: Deploy via SSH
+        uses: appleboy/ssh-action@v0.1.10
+        with:
+          host: ${{ env.SSH_HOST }}
+          username: ${{ env.SSH_USER }}
+          key_path: private_key
+          port: ${{ env.SSH_PORT }}
+          script: |
+            cd /home/ubuntu/leftprazz/repo/crypto-ai-agent
+            git pull
+            docker compose build --no-cache
+            docker compose down
+            docker compose up -d
