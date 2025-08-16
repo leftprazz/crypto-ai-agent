@@ -891,6 +891,7 @@ def tick():
             if not price_block:
                 logging.info(f"[{coin}] Skipping — data unavailable")
                 continue
+
             rsi14, sma20, sma50 = get_technicals_via_coingecko(coin)
             tech = Technicals(rsi14=rsi14, sma20=sma20, sma50=sma50)
 
@@ -921,16 +922,26 @@ def tick():
             # --- Fase 2 (override): sebelum kirim email, ambil 1 tweet untuk coin ini
             info["sentiment"] = compute_sentiment_with_override(coin)
 
+            # --- Keputusan akhir & payload email
             decision, rationale = decide_entry(
                 info["change_24h_pct"], info["sentiment"], info["price"],
                 info["technicals"], info["volume_24h"], None
             )
             subject, payload = make_email_payload(coin, info, decision, rationale)
-            send_email(subject, payload)
+
+            # Kirim sebagai multipart: plain text = JSON, HTML = template rapi (sama utk "No Entry" & "Consider Entry")
+            plain_text = json.dumps(payload, ensure_ascii=False, indent=2)
+            ts_local = now_local().strftime("%Y-%m-%d %H:%M")
+            html_body = build_alert_email_html(coin, info, decision, rationale, ts_local)
+            send_email_multipart(subject, plain_text, html_body)
+
+            # Update state alert (cooldown/step)
             update_alert_state(coin, step, baseline_price)
             logging.info(f"Alert sent for {coin}: step {step}, decision={decision}")
+
         except Exception as e:
             record_failure("tick", f"{coin}: {e}")
+
     logging.info(f"[X-Quota] {x_quota_status()} | rotation today: {sorted(list(rotation_coins_for_today()))}")
     logging.info("==== Tick end ====")
 
