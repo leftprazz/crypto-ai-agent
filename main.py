@@ -34,7 +34,14 @@ from dotenv import load_dotenv
 load_dotenv()
 os.environ["SSL_CERT_FILE"] = certifi.where()
 os.environ["REQUESTS_CA_BUNDLE"] = certifi.where()
+
+# Twitter
 DISABLE_TWITTER_SCRAPE = os.getenv("DISABLE_TWITTER_SCRAPE", "0") in ("1", "true", "True")
+# ==== X / Twitter quota config ====
+X_MONTHLY_LIMIT = int(os.getenv("X_MONTHLY_LIMIT", "100"))  # Free plan: 100 posts / month
+X_DAILY_BUDGET  = int(os.getenv("X_DAILY_BUDGET", "3"))     # ~100/30 ≈ 3 per day
+# Rotasi: hari genap -> BTC,ETH; hari ganjil -> SOL,HYPE  (boleh diubah)
+ROTATION_GROUPS = [["BTC", "ETH"], ["SOL", "HYPE"]]
 
 # ---------------------------- Config ----------------------------
 
@@ -90,6 +97,18 @@ CREATE TABLE IF NOT EXISTS failures (
     component TEXT NOT NULL,
     detail TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS x_quota (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    date_key TEXT NOT NULL,   -- YYYY-MM-DD (UTC)
+    month_key TEXT NOT NULL,  -- YYYY-MM (UTC)
+    used_today INTEGER NOT NULL DEFAULT 0,
+    used_month INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS ux_xquota_day ON x_quota(date_key);
+CREATE INDEX IF NOT EXISTS ix_xquota_month ON x_quota(month_key);
+
 """
 
 with ENGINE.begin() as conn:
@@ -118,6 +137,73 @@ def backoff_delays():
     for _ in range(5):
         yield delay
         delay *= 2
+
+# ==== Quota helpers (X API) ====
+def utc_today_key():
+    return datetime.utcnow().strftime("%Y-%m-%d")
+
+def utc_month_key():
+    return datetime.utcnow().strftime("%Y-%m")
+
+def _ensure_quota_row():
+    dkey, mkey = utc_today_key(), utc_month_key()
+    with ENGINE.begin() as conn:
+        row = conn.execute(
+            text("SELECT id, used_today, used_month, month_key FROM x_quota WHERE date_key=:d"),
+            {"d": dkey}
+        ).mappings().first()
+        if row:
+            # jika bulan berganti, reset used_month ke 0
+            if row["month_key"] != mkey:
+                conn.execute(text(
+                    "UPDATE x_quota SET used_today=0, used_month=0, month_key=:m WHERE id=:id"
+                ), {"m": mkey, "id": row["id"]})
+        else:
+            conn.execute(text(
+                "INSERT INTO x_quota(date_key, month_key, used_today, used_month) VALUES(:d,:m,0,0)"
+            ), {"d": dkey, "m": mkey})
+
+def x_quota_status():
+    _ensure_quota_row()
+    dkey, mkey = utc_today_key(), utc_month_key()
+    with ENGINE.begin() as conn:
+        row = conn.execute(
+            text("SELECT used_today, used_month FROM x_quota WHERE date_key=:d"),
+            {"d": dkey}
+        ).mappings().first()
+    used_today = row["used_today"] if row else 0
+    used_month = row["used_month"] if row else 0
+    return {
+        "used_today": used_today,
+        "remaining_today": max(0, X_DAILY_BUDGET - used_today),
+        "used_month": used_month,
+        "remaining_month": max(0, X_MONTHLY_LIMIT - used_month),
+    }
+
+def x_quota_consume(n=1):
+    _ensure_quota_row()
+    dkey = utc_today_key()
+    with ENGINE.begin() as conn:
+        conn.execute(text("""
+            UPDATE x_quota
+               SET used_today = used_today + :n,
+                   used_month = used_month + :n
+             WHERE date_key = :d
+        """), {"n": n, "d": dkey})
+
+def rotation_coins_for_today():
+    # gunakan tanggal UTC untuk rotasi yang stabil
+    idx = datetime.utcnow().toordinal() % len(ROTATION_GROUPS)
+    return set(ROTATION_GROUPS[idx])
+
+def twitter_allowed_today(coin: str, override: bool = False) -> bool:
+    qs = x_quota_status()
+    if qs["remaining_today"] <= 0 or qs["remaining_month"] <= 0:
+        return False
+    if override:
+        return True
+    # hanya coin yang masuk grup rotasi hari ini
+    return coin in rotation_coins_for_today()
 
 # ---------------------------- Data Sources ----------------------------
 
@@ -355,44 +441,72 @@ def score_texts(texts: List[str]) -> Tuple[float, float]:
     conf = float(min(1.0, abs(mean)))
     return (mean, conf)
 
-def fetch_twitter_texts(query: str, limit: int = 50) -> List[str]:
+def fetch_twitter_texts(query: str, limit: int = 50, *, coin: str | None = None, override: bool = False) -> List[str]:
+    # Patuh kuota/rotasi
+    c = (coin or "").upper()
+    if not twitter_allowed_today(c, override=override):
+        return []
+
+    # 1) X API (jika bearer tersedia)
     headers = {"Authorization": f"Bearer {TWITTER_BEARER}"} if TWITTER_BEARER else None
     if headers:
         try:
+            # Ambil kecil saja & pilih yang paling “bermakna”
             url = "https://api.twitter.com/2/tweets/search/recent"
-            params = {"query": f"{query} -is:retweet lang:en", "max_results": min(100, limit), "tweet.fields": "created_at,lang"}
+            params = {
+                "query": f"{query} -is:retweet lang:en",
+                "max_results": 10,  # kecil supaya hemat
+                "tweet.fields": "created_at,lang,public_metrics"
+            }
             r = requests.get(url, params=params, headers=headers, timeout=20)
             if r.status_code == 429:
                 record_failure("twitter_rate", r.text[:200])
                 return []
             r.raise_for_status()
             data = r.json().get("data", [])
-            return [d.get("text","") for d in data]
+            if not data:
+                return []
+
+            # Pilih 1 tweet paling tinggi engagement (hemat 1 kuota)
+            data.sort(key=lambda t: sum((t.get("public_metrics") or {}).values()), reverse=True)
+            picked = data[:1]  # <-- hanya 1 post/hit
+            texts = [d.get("text","") for d in picked if d.get("text")]
+
+            # Catat konsumsi kuota (1 post pull)
+            if texts:
+                x_quota_consume(1)
+            return texts
         except Exception as e:
             record_failure("twitter_api", str(e))
+            # jangan jatuh ke scraper kalau bearer ada; tetap hemat kuota
             return []
 
+    # 2) Jika DISABLE_TWITTER_SCRAPE, langsung skip
     if DISABLE_TWITTER_SCRAPE:
         return []
 
+    # 3) Fallback snscrape (akan jarang dipakai; tetap 1 kuota agar konsisten)
     try:
         import subprocess, json as _json, hashlib
         since_ts = int((datetime.now(timezone.utc)-timedelta(hours=24)).timestamp())
-        cmd = ["snscrape", "--jsonl", "--max-results", str(limit), "twitter-search", f"{query} lang:en since_time:{since_ts}"]
+        cmd = ["snscrape", "--jsonl", "--max-results", "10", "twitter-search", f"{query} lang:en since_time:{since_ts}"]
         out = subprocess.check_output(cmd, text=True, timeout=25)
-        texts, seen = [], set()
+        best_line = None
+        best_score = -1
         for line in out.splitlines():
             obj = _json.loads(line)
-            content = obj.get("content","")
-            h = hashlib.sha1(content.encode("utf-8")).hexdigest()
-            if h in seen:
-                continue
-            seen.add(h)
-            texts.append(content)
-        return texts
+            pm = obj.get("retweetCount", 0) + obj.get("likeCount", 0) + obj.get("replyCount", 0) + obj.get("quoteCount", 0)
+            if pm > best_score:
+                best_score = pm
+                best_line = obj.get("content", "")
+        if best_line:
+            x_quota_consume(1)
+            return [best_line]
+        return []
     except Exception as e:
         record_failure("snscrape", str(e)[:300])
         return []
+
 
 def fetch_news_texts(coin: str, limit: int = 20) -> Tuple[List[str], List[str]]:
     q_terms = {
@@ -468,6 +582,32 @@ def compute_sentiment(coin: str) -> SentimentBlock:
         weights.append(max(0.01, news_conf))
         comps.append(news_score)
     composite = 0.0 if not weights else float(np.average(comps, weights=weights))
+    return SentimentBlock(
+        composite=composite,
+        twitter_x={"score": tw_score, "confidence": tw_conf, "sample_size": len(tw_texts)},
+        news={"score": news_score, "confidence": news_conf, "top_headlines": headlines}
+    )
+
+def compute_sentiment_light(coin: str) -> SentimentBlock:
+    # versi ringan: hanya news (tanpa twitter) agar hemat kuota saat non-alert
+    news_texts, headlines = fetch_news_texts(coin, limit=20)
+    news_score, news_conf = score_texts(news_texts)
+    return SentimentBlock(
+        composite=news_score if news_texts else 0.0,
+        twitter_x={"score": 0.0, "confidence": 0.0, "sample_size": 0},
+        news={"score": news_score, "confidence": news_conf, "top_headlines": headlines}
+    )
+
+def compute_sentiment_with_override(coin: str) -> SentimentBlock:
+    # ambil 1 tweet override + news
+    tw_texts = fetch_twitter_texts(coin, limit=10, coin=coin, override=True)
+    tw_score, tw_conf = score_texts(tw_texts)
+    news_texts, headlines = fetch_news_texts(coin, limit=20)
+    news_score, news_conf = score_texts(news_texts)
+    weights, comps = [], []
+    if tw_texts: weights.append(max(0.01, tw_conf)); comps.append(tw_score)
+    if news_texts: weights.append(max(0.01, news_conf)); comps.append(news_score)
+    composite = float(np.average(comps, weights=weights)) if weights else 0.0
     return SentimentBlock(
         composite=composite,
         twitter_x={"score": tw_score, "confidence": tw_conf, "sample_size": len(tw_texts)},
@@ -744,11 +884,29 @@ def tick():
     logging.info("==== Tick start ====")
     for coin in COINS:
         try:
-            info = fetch_all_for_coin(coin)
-            if not info:
+            # --- Fase 0: data harga/teknikal
+            price_block = get_price_primary(coin) or get_price_fallback(coin)
+            if not price_block:
                 logging.info(f"[{coin}] Skipping — data unavailable")
                 continue
+            rsi14, sma20, sma50 = get_technicals_via_coingecko(coin)
+            tech = Technicals(rsi14=rsi14, sma20=sma20, sma50=sma50)
 
+            # --- Fase 1: sentiment ringan (tanpa Twitter) agar hemat kuota
+            sent = compute_sentiment_light(coin)
+
+            info = {
+                "price": price_block["price"],
+                "change_24h_pct": price_block["change_24h_pct"],
+                "volume_24h": price_block["volume_24h"],
+                "range_low": price_block["range_low"],
+                "range_high": price_block["range_high"],
+                "source": price_block["source"],
+                "technicals": tech,
+                "sentiment": sent
+            }
+
+            # Keputusan alert murni dari %24h & cooldown/step
             should, step, baseline_price = should_alert(coin, info["change_24h_pct"], info["price"])
             if not should:
                 pct = info.get("change_24h_pct")
@@ -758,22 +916,20 @@ def tick():
                     logging.info(f"[{coin}] Skipping email alert — cooldown/new step not met")
                 continue
 
+            # --- Fase 2 (override): sebelum kirim email, ambil 1 tweet untuk coin ini
+            info["sentiment"] = compute_sentiment_with_override(coin)
+
             decision, rationale = decide_entry(
                 info["change_24h_pct"], info["sentiment"], info["price"],
                 info["technicals"], info["volume_24h"], None
             )
             subject, payload = make_email_payload(coin, info, decision, rationale)
-
-            # NEW: kirim multipart (text + HTML)
-            ts_local = now_local().strftime("%Y-%m-%d %H:%M")
-            html_body = build_alert_email_html(coin, info, decision, rationale, ts_local)
-            plain_text = json.dumps(payload, ensure_ascii=False, indent=2)
-            send_email_multipart(subject, plain_text, html_body)
-
+            send_email(subject, payload)
             update_alert_state(coin, step, baseline_price)
             logging.info(f"Alert sent for {coin}: step {step}, decision={decision}")
         except Exception as e:
             record_failure("tick", f"{coin}: {e}")
+    logging.info(f"[X-Quota] {x_quota_status()} | rotation today: {sorted(list(rotation_coins_for_today()))}")
     logging.info("==== Tick end ====")
 
 def daily_digest():
